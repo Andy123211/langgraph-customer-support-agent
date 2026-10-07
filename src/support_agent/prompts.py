@@ -33,7 +33,7 @@ Your primary responsibilities:
 Available Tools:
 - send_greeting: Send a welcome greeting message introducing the agent and available services. ALWAYS use this tool when this is the first interaction with a customer (when there are no previous messages in the conversation)
 - list_available_functions: List all available functions and actions the agent can perform (use this when customers ask "what can you do?" or "what functions are available?")
-- search_vector_knowledge_base: Search the knowledge base with semantic similarity for store policies, FAQ answers, and product information
+- search_vector_knowledge_base: Search the knowledge base with BM25 + vector hybrid retrieval and RRF fusion for store policies, FAQ answers, and product information
 - get_order_status: Look up order tracking and delivery status for a specific order
 - list_orders: List orders and filter them by status (e.g., "not_shipped", "processing", "in_transit", "delivered"). Use this when customers ask about multiple orders or want to see all orders that haven't shipped yet
 - initiate_return: Start the return process for orders
@@ -46,6 +46,8 @@ Guidelines for Success:
 - Keep responses concise (2-3 sentences) unless more detail is requested
 - When customers ask "what can you do?", "what functions are available?", "what actions can you perform?", "what tools do you have?", or "list your capabilities", use the list_available_functions tool to show all capabilities
 - Always search the knowledge base first for policy-related questions
+- Treat the knowledge search relevance score as a retrieval heuristic, not a probability. If the tool reports HANDOFF_REQUIRED, do not answer from memory; the workflow will create a human-support handoff.
+- If an order, return, or inventory tool reports an execution error, do not invent a result; the workflow will hand the case to human support.
 - Use get_order_status when a customer asks about a specific order by order number
 - Use list_orders when customers ask about multiple orders, want to see all orders, or ask about orders filtered by status (e.g., "show me all orders that haven't shipped yet", "list all pending orders")
 - Call multiple tools if needed to fully resolve the customer's issue
@@ -82,6 +84,8 @@ Use tools to help customers:
 - check_product_availability: Check stock
 - escalate_to_human: Transfer to human
 
+Knowledge search uses BM25 + vector retrieval with RRF fusion. Treat scores as heuristics;
+do not answer when the tool reports HANDOFF_REQUIRED. Tool execution errors are handed off.
 Be helpful, concise, and escalate when needed.
 """
 

@@ -30,6 +30,8 @@ from pathlib import Path
 from .vector_store import get_vector_store
 from .prompts import INITIAL_GREETING
 
+KB_CONFIDENCE_THRESHOLD = 0.35
+
 
 # Mock data - in production, replace with real database/API calls
 # WHAT: Sample order and inventory data for testing/demo purposes
@@ -723,16 +725,17 @@ You can also check our online catalog at: www.store.com/products"""
 def search_vector_knowledge_base(
     query: str,
     max_results: int = 5,
-    min_similarity_score: float = 0.0,
+    min_similarity_score: float = KB_CONFIDENCE_THRESHOLD,
     categories: str = ""
 ) -> str:
     """
-    Advanced vector search across the knowledge base with similarity scoring.
+    Hybrid BM25 and vector search across the knowledge base with an RRF-fused ranking.
     
     WHAT IT DOES:
-    Performs semantic similarity search (not just keyword matching) across the
-    knowledge base. This can find relevant information even when the wording doesn't
-    exactly match. Includes similarity scores so you can filter by relevance.
+    Combines keyword-based BM25 retrieval with semantic vector retrieval. Reciprocal
+    rank fusion (RRF) combines both rankings; a reranker can be injected into the
+    vector-store adapter without changing this tool. The displayed score is a relevance
+    heuristic, not a calibrated probability.
 
     WHY IT'S IMPORTANT:
     This is more powerful than the basic search_knowledge_base because:
@@ -742,10 +745,10 @@ def search_vector_knowledge_base(
     - Useful for complex questions that need multiple information sources
     
     HOW IT WORKS:
-    1. Converts query into embedding (vector representation of meaning)
-    2. Compares against all documents in vector store using cosine similarity
-    3. Returns top results with similarity scores (0.0 to 1.0)
-    4. Filters by minimum score threshold and optional categories
+    1. Runs BM25 over the local knowledge base
+    2. Runs semantic vector retrieval over the same documents
+    3. Fuses both ranked lists with RRF and optionally reranks candidates
+    4. Applies a configurable low-relevance threshold and category filter
 
     Use this tool for complex queries that need:
     - Semantic similarity matching (finds conceptually related content)
@@ -762,7 +765,8 @@ def search_vector_knowledge_base(
     Args:
         query: The customer's question or search terms (uses semantic similarity)
         max_results: Maximum number of results to return (1-10, default: 5)
-        min_similarity_score: Minimum similarity score threshold 0.0-1.0 (default: 0.0)
+        min_similarity_score: Minimum relevance heuristic threshold 0.0-1.0
+                             (default: 0.35; tune against a held-out evaluation set)
                              Higher values = stricter matching. Typical values:
                              - 0.0: Return all results (most permissive)
                              - 0.3: Somewhat related content
@@ -799,22 +803,27 @@ def search_vector_knowledge_base(
         valid_categories = {"product", "shipping", "return", "payment", "general"}
         category_list = [cat for cat in category_list if cat in valid_categories]
 
-    # Perform search with filters
+    # A caller may make the threshold stricter, but cannot disable the low-confidence
+    # handoff guard by asking for a zero threshold.
+    confidence_threshold = max(min_similarity_score, KB_CONFIDENCE_THRESHOLD)
+
+    # Perform hybrid search with category filters.
     results = vector_store.search_with_scores(
         query=query,
         k=max_results,
         filter_categories=category_list if category_list else None,
-        score_threshold=min_similarity_score
+        score_threshold=confidence_threshold
     )
 
     if not results:
         filter_info = f" (filtered by: {', '.join(category_list)})" if category_list else ""
         score_info = f" with minimum score {min_similarity_score}" if min_similarity_score > 0 else ""
-        return f"""❌ No Relevant Information Found
+        return f"""HANDOFF_REQUIRED: low_confidence_retrieval
+❌ No Confident Match Found
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-No relevant information found{filter_info}{score_info}.
+No sufficiently relevant information found{filter_info}{score_info}.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -823,10 +832,10 @@ No relevant information found{filter_info}{score_info}.
    • Lowering the similarity threshold
    • Removing category filters
 
-Would you like me to search again with different parameters?"""
+This request should be handed to a human agent instead of answered from weak matches."""
 
     # Format results with scores and metadata
-    formatted_results = ["🔍 Vector Knowledge Base Search Results\n"]
+    formatted_results = ["🔍 Hybrid Knowledge Base Search Results (BM25 + vectors, RRF)\n"]
     formatted_results.append("━" * 70)
     formatted_results.append("")
     formatted_results.append(f"Query: '{query}'")
@@ -846,6 +855,7 @@ Would you like me to search again with different parameters?"""
     for i, (doc, score) in enumerate(results, 1):
         category = doc.metadata.get("category", "unknown")
         doc_type = doc.metadata.get("type", "unknown")
+        source_id = doc.metadata.get("source_id", doc.id or "knowledge_base")
 
         # Visual indicators for relevance
         if score >= 0.7:
@@ -861,6 +871,7 @@ Would you like me to search again with different parameters?"""
         formatted_results.append(f"│  Relevance: {relevance} ({score:.3f})")
         formatted_results.append(f"│  Category:  {category.title()}")
         formatted_results.append(f"│  Type:      {doc_type.title()}")
+        formatted_results.append(f"│  Source:    {source_id}")
         formatted_results.append(f"├─")
         formatted_results.append(f"│  {doc.page_content.strip().replace(chr(10), chr(10) + '│  ')}")
         

@@ -17,7 +17,8 @@ from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_core.documents import Document
 import json
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
+from .retrieval import bm25_relevance, bm25_scores, reciprocal_rank_fusion
 
 
 class KnowledgeBaseVectorStore:
@@ -36,7 +37,11 @@ class KnowledgeBaseVectorStore:
     wording than what's in the knowledge base.
     """
 
-    def __init__(self, embeddings_model: str = "sentence-transformers/all-MiniLM-L6-v2"):
+    def __init__(
+        self,
+        embeddings_model: str = "sentence-transformers/all-MiniLM-L6-v2",
+        reranker: Optional[Callable[[str, list[Document]], list[Document]]] = None,
+    ):
         """
         Initialize the vector store with embeddings model.
         
@@ -59,6 +64,10 @@ class KnowledgeBaseVectorStore:
             encode_kwargs={'normalize_embeddings': True}
         )
         self.vector_store: Optional[InMemoryVectorStore] = None
+        self.documents_by_id: dict[str, Document] = {}
+        # Optional local or remote cross-encoder adapter. The default path has no
+        # additional model or service dependency.
+        self.reranker = reranker
 
     def load_from_json(self, json_path: str) -> None:
         """
@@ -85,9 +94,16 @@ class KnowledgeBaseVectorStore:
         documents = self._json_to_documents(data)
 
         # Create vector store
+        self.documents_by_id = {}
+        for index, doc in enumerate(documents):
+            document_id = f"kb-{index}"
+            self.documents_by_id[document_id] = Document(
+                page_content=doc.page_content,
+                metadata={**doc.metadata, "source_id": document_id},
+            )
         self.vector_store = InMemoryVectorStore.from_documents(
-            documents=documents,
-            embedding=self.embeddings
+            documents=list(self.documents_by_id.values()),
+            embedding=self.embeddings,
         )
 
         print(f"✅ Loaded {len(documents)} documents into vector store")
@@ -222,125 +238,96 @@ Answer: {faq.get('answer', '')}
         return documents
 
     def search(self, query: str, k: int = 3, filter_category: Optional[str] = None) -> str:
-        """
-        Search the knowledge base for relevant information.
-        
-        WHAT IT DOES:
-        Performs semantic similarity search - converts the query to a vector, compares it
-        against all documents in the vector store, and returns the most similar ones.
-        Can optionally filter by category (e.g., only search return policies).
-
-        WHY IT'S IMPORTANT:
-        This is the core search functionality that tools use. When a customer asks "What's
-        your return policy?", this finds the relevant return policy information even if
-        the question uses different wording than what's in the knowledge base.
-
-        HOW IT WORKS:
-        1. Convert query to embedding (vector)
-        2. Compare against all document embeddings using cosine similarity
-        3. Return top k most similar documents
-        4. Optional: Filter to specific category before searching
-
-        Args:
-            query: Customer's question or search terms
-            k: Number of results to return (default: 3)
-            filter_category: Optional category filter (return, shipping, payment, product, general)
-                            Only searches documents in that category
-
-        Returns:
-            Formatted search results as a string
-        """
-        if self.vector_store is None:
-            return "Error: Vector store not initialized. Please load knowledge base first."
-
-        # Perform similarity search
-        if filter_category:
-            # Create filter function that checks Document metadata
-            def metadata_filter(doc: Document) -> bool:
-                return doc.metadata.get("category") == filter_category
-
-            results = self.vector_store.similarity_search(
-                query,
-                k=k,
-                filter=metadata_filter
-            )
-        else:
-            results = self.vector_store.similarity_search(query, k=k)
-
+        """Return concise hybrid-retrieval results for a customer query."""
+        categories = [filter_category] if filter_category else None
+        results = self.search_with_scores(query, k=k, filter_categories=categories)
         if not results:
             return "No relevant information found in the knowledge base."
-
-        # Format results
-        formatted_results = []
-        for i, doc in enumerate(results, 1):
-            formatted_results.append(f"{doc.page_content.strip()}")
-
-        return "\n\n".join(formatted_results)
+        return "\n\n".join(doc.page_content.strip() for doc, _ in results)
 
     def search_with_scores(
         self,
         query: str,
         k: int = 5,
         filter_categories: Optional[list[str]] = None,
-        score_threshold: float = 0.0
+        score_threshold: float = 0.0,
     ) -> list[tuple[Document, float]]:
+        """Retrieve with BM25 and vector search, fuse ranks with RRF, and rerank optionally.
+
+        Returned values are heuristic relevance indicators, not calibrated confidence
+        probabilities. A supplied reranker receives the query and fused candidate list
+        and returns those documents in its preferred order.
         """
-        Search the knowledge base with similarity scores.
-        
-        WHAT IT DOES:
-        Same as search() but also returns similarity scores for each result. Scores indicate
-        how relevant each result is (0.0 = not relevant, 1.0 = very relevant). This allows
-        filtering out low-relevance results and showing customers how confident the match is.
-
-        WHY IT'S IMPORTANT:
-        Sometimes search results aren't very relevant. With scores, you can:
-        - Filter out results below a certain relevance threshold
-        - Show users how confident the match is
-        - Debug why certain searches aren't working (low scores indicate poor matches)
-        - Make the agent smarter by only using highly-relevant information
-
-        Args:
-            query: Customer's question or search terms
-            k: Maximum number of results to return
-            filter_categories: Optional list of categories to filter by (can search multiple)
-            score_threshold: Minimum similarity score (0.0 to 1.0) - filters out low-relevance results
-
-        Returns:
-            List of (Document, score) tuples, sorted by relevance (highest score first)
-            Score is 0.0-1.0 where 1.0 means very similar, 0.0 means not similar
-        """
-        if self.vector_store is None:
+        if self.vector_store is None or not self.documents_by_id:
             return []
 
-        # Perform similarity search with scores
-        if filter_categories:
-            # Create filter function for multiple categories
-            def metadata_filter(doc: Document) -> bool:
-                return doc.metadata.get("category") in filter_categories
+        eligible = {
+            document_id: document
+            for document_id, document in self.documents_by_id.items()
+            if not filter_categories
+            or document.metadata.get("category") in filter_categories
+        }
+        if not eligible:
+            return []
 
-            results = self.vector_store.similarity_search_with_score(
-                query,
-                k=k,
-                filter=metadata_filter
+        def metadata_filter(document: Document) -> bool:
+            return not filter_categories or document.metadata.get("category") in filter_categories
+
+        candidate_k = min(len(eligible), max(k * 2, 10))
+        lexical_raw = bm25_scores(
+            query,
+            {document_id: document.page_content for document_id, document in eligible.items()},
+        )
+        lexical_ranked = sorted(
+            (document_id for document_id, score in lexical_raw.items() if score > 0),
+            key=lambda document_id: (-lexical_raw[document_id], document_id),
+        )[:candidate_k]
+
+        # InMemoryVectorStore returns cosine similarity here (higher is better).
+        vector_hits = self.vector_store.similarity_search_with_score(
+            query,
+            k=candidate_k,
+            filter=metadata_filter,
+        )
+        vector_ranked: list[str] = []
+        vector_relevance: dict[str, float] = {}
+        for document, score in vector_hits:
+            document_id = document.metadata.get("source_id")
+            if document_id not in eligible:
+                # Compatibility fallback for vector-store adapters that omit ids.
+                document_id = next(
+                    (key for key, value in eligible.items() if value.page_content == document.page_content),
+                    None,
+                )
+            if document_id is None:
+                continue
+            vector_ranked.append(document_id)
+            vector_relevance[document_id] = max(0.0, min(1.0, float(score)))
+
+        fused_ids = reciprocal_rank_fusion(lexical_ranked, vector_ranked)
+        if self.reranker is not None and fused_ids:
+            candidates = [eligible[document_id] for document_id in fused_ids]
+            reranked = self.reranker(query, candidates)
+            reranked_ids = [
+                document.metadata.get("source_id") for document in reranked
+                if document.metadata.get("source_id") in eligible
+            ]
+            fused_ids = reranked_ids + [
+                document_id for document_id in fused_ids if document_id not in reranked_ids
+            ]
+
+        ranked_results = []
+        for document_id in fused_ids:
+            document = eligible[document_id]
+            relevance = max(
+                vector_relevance.get(document_id, 0.0),
+                bm25_relevance(lexical_raw.get(document_id, 0.0)),
             )
-        else:
-            results = self.vector_store.similarity_search_with_score(query, k=k)
-
-        # Filter by score threshold and return
-        # Note: Lower scores mean higher similarity in some implementations
-        # InMemoryVectorStore returns distance, so lower is better
-        # We convert to similarity score (higher is better) for consistency
-        filtered_results = []
-        for doc, distance in results:
-            # Convert distance to similarity (assuming cosine distance)
-            # For normalized embeddings with cosine similarity:
-            # similarity = 1 - distance
-            similarity = 1.0 - distance
-
-            if similarity >= score_threshold:
-                filtered_results.append((doc, similarity))
-
-        return filtered_results
+            if relevance >= score_threshold:
+                ranked_results.append((document, relevance))
+            if len(ranked_results) >= k:
+                break
+        return ranked_results
 
 
 # Global instance - initialized lazily

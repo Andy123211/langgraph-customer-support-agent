@@ -79,11 +79,11 @@ For detailed developer setup instructions, see [DEVELOPER_SETUP.md](DEVELOPER_SE
 
 # Customer Support Bot Technical Documentation
 
-A production-ready customer support agent built with LangGraph, featuring intelligent tool calling, conversation memory, and local LLM support via Ollama.
+A customer-support agent demo built with LangGraph, featuring tool calling, conversation history, hybrid knowledge retrieval, and local LLM support via Ollama.
 
 ## 🎉 What You Have
 
-A complete, production-ready customer support agent built with:
+A runnable customer-support demo built with:
 
 - ✅ LangGraph for orchestration
 - ✅ Local LLM via Ollama (privacy-first)
@@ -91,7 +91,8 @@ A complete, production-ready customer support agent built with:
 - ✅ Visual debugging with LangGraph Studio
 - ✅ REST API ready to use
 - ✅ Full documentation and examples
-- ✅ Vector store implementation for semantic search
+- ✅ Hybrid BM25 + vector retrieval with reciprocal-rank fusion (RRF)
+- ✅ Low-relevance and tool-error handoff state transitions
 - ✅ LangSmith evaluation suite with online dashboard
 - ✅ Comprehensive test suite (50+ unit tests)
 
@@ -103,8 +104,19 @@ A complete, production-ready customer support agent built with:
 - 🎨 **LangGraph Studio**: Visual debugging and testing UI
 - 🚀 **Local First**: Runs entirely on your machine with Ollama
 - 📊 **REST API**: Auto-generated endpoints via LangGraph Dev
-- 🔍 **Semantic Search**: Vector-based knowledge base search
+- 🔍 **Hybrid RAG**: BM25 and vector recall fused with RRF; an optional reranker adapter can reorder fused candidates
 - 📊 **LangSmith Evals**: Automated testing with online dashboard
+
+### Hybrid retrieval and handoff behavior
+
+Policy and product questions use two retrieval paths over the same local knowledge base:
+
+1. BM25 ranks exact terms and identifiers.
+2. `InMemoryVectorStore` ranks semantic matches with the configured Hugging Face embedding model.
+3. Reciprocal-rank fusion combines the two ranked lists. A reranker can be injected into `KnowledgeBaseVectorStore(reranker=...)`; its default is disabled and needs no additional service.
+4. The tool reports a bounded relevance heuristic. If no result reaches the default `0.35` threshold, the graph records `handoff_required` and creates a human-support ticket instead of answering from weak evidence.
+
+The threshold and displayed score are demo heuristics, not calibrated confidence probabilities. Tune them against a held-out support-query set before using this pattern beyond a demo. Order, return, and inventory tools remain mock-data examples. Tool exceptions are caught by the graph, hidden from the customer, and routed to the human handoff node.
 
 ## Prerequisites
 
