@@ -11,7 +11,7 @@ Without this, the graph wouldn't know how to store and manage conversation histo
 """
 
 from typing import Annotated
-from typing_extensions import TypedDict
+from typing_extensions import NotRequired, TypedDict
 from langgraph.graph.message import add_messages
 from langchain_core.messages import BaseMessage
 
@@ -38,6 +38,9 @@ class SupportState(TypedDict):
     """
     
     messages: Annotated[list[BaseMessage], add_messages]
+    handoff_required: NotRequired[bool]
+    handoff_reason: NotRequired[str]
+    support_status: NotRequired[str]
     """
     Conversation history - the complete record of the conversation.
     

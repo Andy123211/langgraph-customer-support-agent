@@ -2,8 +2,22 @@
 
 import pytest
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
-from src.support_agent.agent import should_continue, agent_node, create_graph
+from src.support_agent.agent import (
+    should_continue,
+    agent_node,
+    create_graph,
+    execute_tools_node,
+    route_after_tools,
+)
 from src.support_agent.state import SupportState
+
+
+class FakeChatModel:
+    def __init__(self, response):
+        self.response = response
+
+    def invoke(self, _messages):
+        return self.response
 
 
 class TestShouldContinue:
@@ -68,11 +82,160 @@ class TestShouldContinue:
         assert result == "__end__"
 
 
+class TestToolFallbackRouting:
+    """Test deterministic handoff paths without an LLM or external services."""
+
+    def test_low_confidence_retrieval_routes_to_human(self, monkeypatch):
+        class LowConfidenceTool:
+            name = "search_mock"
+
+            @staticmethod
+            def invoke(_args):
+                return "HANDOFF_REQUIRED: low_confidence_retrieval\nNo grounded match."
+
+        from src.support_agent import agent as agent_module
+
+        monkeypatch.setitem(agent_module._tools_by_name, "search_mock", LowConfidenceTool())
+        state = {
+            "messages": [
+                HumanMessage(content="What is the policy for a very unusual case?"),
+                AIMessage(
+                    content="",
+                    tool_calls=[{
+                        "name": "search_mock",
+                        "args": {"query": "unusual case"},
+                        "id": "call-search",
+                    }],
+                ),
+            ]
+        }
+
+        update = execute_tools_node(state)
+        routed_state = {**state, **update}
+
+        assert update["handoff_reason"] == "low_confidence_retrieval"
+        assert update["support_status"] == "needs_human"
+        assert route_after_tools(routed_state) == "human_handoff"
+
+    def test_tool_exception_routes_to_human_without_exception_details(self, monkeypatch):
+        class FailingTool:
+            name = "failing_mock"
+
+            @staticmethod
+            def invoke(_args):
+                raise RuntimeError("private upstream diagnostic")
+
+        from src.support_agent import agent as agent_module
+
+        monkeypatch.setitem(agent_module._tools_by_name, "failing_mock", FailingTool())
+        state = {
+            "messages": [
+                HumanMessage(content="Check order 123456"),
+                AIMessage(
+                    content="",
+                    tool_calls=[{
+                        "name": "failing_mock",
+                        "args": {},
+                        "id": "call-fail",
+                    }],
+                ),
+            ]
+        }
+
+        update = execute_tools_node(state)
+
+        assert update["handoff_reason"] == "tool_execution_error"
+        assert route_after_tools({**state, **update}) == "human_handoff"
+        assert "private upstream diagnostic" not in update["messages"][0].content
+
+    def test_compiled_graph_completes_low_confidence_handoff(self, monkeypatch):
+        from src.support_agent import agent as agent_module
+
+        monkeypatch.setattr(
+            agent_module,
+            "llm",
+            FakeChatModel(AIMessage(
+                content="",
+                tool_calls=[{
+                    "name": "search_vector_knowledge_base",
+                    "args": {"query": "unlisted exception"},
+                    "id": "call-search-low",
+                }],
+            )),
+        )
+
+        class LowConfidenceTool:
+            @staticmethod
+            def invoke(_args):
+                return "HANDOFF_REQUIRED: low_confidence_retrieval\nNo grounded match."
+
+        class TicketTool:
+            @staticmethod
+            def invoke(args):
+                return f"Ticket created for {args['reason']}"
+
+        monkeypatch.setitem(
+            agent_module._tools_by_name,
+            "search_vector_knowledge_base",
+            LowConfidenceTool(),
+        )
+        monkeypatch.setitem(agent_module._tools_by_name, "escalate_to_human", TicketTool())
+
+        result = create_graph().invoke(
+            {"messages": [HumanMessage(content="Can you make a one-off exception?")]}
+        )
+
+        assert result["support_status"] == "handed_off"
+        assert isinstance(result["messages"][-1], AIMessage)
+        assert "low_confidence_retrieval" in result["messages"][-1].content
+
+    def test_compiled_graph_completes_tool_error_handoff(self, monkeypatch):
+        from src.support_agent import agent as agent_module
+
+        monkeypatch.setattr(
+            agent_module,
+            "llm",
+            FakeChatModel(AIMessage(
+                content="",
+                tool_calls=[{
+                    "name": "get_order_status",
+                    "args": {"order_id": "123456"},
+                    "id": "call-order-error",
+                }],
+            )),
+        )
+
+        class FailingTool:
+            @staticmethod
+            def invoke(_args):
+                raise RuntimeError("private diagnostic")
+
+        class TicketTool:
+            @staticmethod
+            def invoke(args):
+                return f"Ticket created for {args['reason']}"
+
+        monkeypatch.setitem(agent_module._tools_by_name, "get_order_status", FailingTool())
+        monkeypatch.setitem(agent_module._tools_by_name, "escalate_to_human", TicketTool())
+
+        result = create_graph().invoke(
+            {"messages": [HumanMessage(content="Where is order 123456?")]}
+        )
+
+        assert result["support_status"] == "handed_off"
+        assert isinstance(result["messages"][-1], AIMessage)
+        assert "tool_execution_error" in result["messages"][-1].content
+        assert all("private diagnostic" not in str(message.content) for message in result["messages"])
+
+
 class TestAgentNode:
     """Test the agent reasoning node that decides actions."""
 
-    def test_agent_node_returns_messages(self):
+    def test_agent_node_returns_messages(self, monkeypatch):
         """Test that agent_node returns a dict with messages key."""
+        monkeypatch.setattr(
+            "src.support_agent.agent.llm", FakeChatModel(AIMessage(content="I can help with that."))
+        )
         state: SupportState = {
             "messages": [HumanMessage(content="Hello, I need help with my order")]
         }
@@ -84,8 +247,11 @@ class TestAgentNode:
         assert isinstance(result["messages"], list), "Messages should be a list"
         assert len(result["messages"]) > 0, "Should return at least one message"
 
-    def test_agent_node_returns_ai_message(self):
+    def test_agent_node_returns_ai_message(self, monkeypatch):
         """Test that agent_node returns AIMessage type."""
+        monkeypatch.setattr(
+            "src.support_agent.agent.llm", FakeChatModel(AIMessage(content="I can help with that."))
+        )
         state: SupportState = {
             "messages": [HumanMessage(content="What's your return policy?")]
         }
@@ -95,8 +261,12 @@ class TestAgentNode:
 
         assert isinstance(message, AIMessage), "Should return AIMessage"
 
-    def test_agent_node_preserves_conversation_context(self):
+    def test_agent_node_preserves_conversation_context(self, monkeypatch):
         """Test that agent has access to conversation history."""
+        monkeypatch.setattr(
+            "src.support_agent.agent.llm",
+            FakeChatModel(AIMessage(content="Received conversation context.")),
+        )
         state: SupportState = {
             "messages": [
                 HumanMessage(content="Hi, my order number is 123456"),
@@ -131,8 +301,12 @@ class TestGraphCreation:
         # based on LangGraph's API
         assert graph is not None
 
-    def test_graph_invoke_with_simple_message(self):
+    def test_graph_invoke_with_simple_message(self, monkeypatch):
         """Test that graph can process a simple message."""
+        monkeypatch.setattr(
+            "src.support_agent.agent.llm",
+            FakeChatModel(AIMessage(content="Hello! How can I help?")),
+        )
         graph = create_graph()
 
         state: SupportState = {

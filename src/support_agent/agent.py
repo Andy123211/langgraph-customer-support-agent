@@ -19,9 +19,8 @@ This is the core orchestration layer that makes the agent work as a cohesive sys
 from typing import Literal, cast
 import os
 from langgraph.graph import StateGraph, END, START
-from langgraph.prebuilt import ToolNode
 from langchain_ollama import ChatOllama
-from langchain_core.messages import SystemMessage, AIMessage, HumanMessage
+from langchain_core.messages import SystemMessage, AIMessage, HumanMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from pathlib import Path
 
@@ -39,7 +38,7 @@ from .prompts import SYSTEM_PROMPT
 # Get Ollama base URL from environment, default to localhost for local development
 ollama_base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 llm = ChatOllama(
-    model="llama3.1:latest",  # Smaller, faster model for CPU inference (~1GB, much faster responses)
+    model=os.getenv("MODEL_NAME", "llama3.1:latest"),
     temperature=0,  # Deterministic responses for customer support
     base_url=ollama_base_url,  # Use environment variable or default to localhost
     timeout=60.0,  # Reduce timeout from 120s to 60s for faster failure detection
@@ -128,6 +127,91 @@ def should_continue(state: SupportState) -> Literal["tools", "__end__"]:
     return "__end__"
 
 
+_tools_by_name = {support_tool.name: support_tool for support_tool in tools}
+
+
+def execute_tools_node(state: SupportState) -> dict:
+    """Execute requested tools and turn exceptions or weak retrieval into a handoff."""
+    last_message = state["messages"][-1]
+    if not isinstance(last_message, AIMessage) or not last_message.tool_calls:
+        return {"messages": []}
+
+    tool_messages = []
+    handoff_reason = None
+    support_status = state.get("support_status", "active")
+    for tool_call in last_message.tool_calls:
+        name = tool_call.get("name", "unknown_tool")
+        tool_call_id = tool_call.get("id", f"call-{len(tool_messages)}")
+        try:
+            support_tool = _tools_by_name[name]
+            result = support_tool.invoke(tool_call.get("args", {}))
+            content = str(result)
+            if content.startswith("HANDOFF_REQUIRED:"):
+                handoff_reason = content.splitlines()[0].partition(":")[2].strip()
+                support_status = "needs_human"
+            elif name == "escalate_to_human":
+                support_status = "handed_off"
+        except Exception as error:
+            # Keep internal exception text out of the user-facing conversation.
+            print(f"Tool execution failed for {name}: {type(error).__name__}")
+            content = (
+                "TOOL_EXECUTION_ERROR: This operation could not be completed. "
+                "The customer should be transferred to human support."
+            )
+            handoff_reason = "tool_execution_error"
+            support_status = "needs_human"
+
+        tool_messages.append(
+            ToolMessage(content=content, tool_call_id=tool_call_id, name=name)
+        )
+
+    update = {"messages": tool_messages, "support_status": support_status}
+    if handoff_reason:
+        update.update({"handoff_required": True, "handoff_reason": handoff_reason})
+    return update
+
+
+def route_after_tools(state: SupportState) -> Literal["human_handoff", "agent"]:
+    """Route low-confidence retrieval and tool failures directly to human support."""
+    if state.get("handoff_required", False):
+        return "human_handoff"
+    return "agent"
+
+
+def automatic_handoff_node(state: SupportState) -> dict:
+    """Create a demo support ticket after retrieval or tool execution needs a human."""
+    customer_message = next(
+        (
+            str(message.content)
+            for message in reversed(state["messages"])
+            if isinstance(message, HumanMessage)
+        ),
+        "Customer support request",
+    )
+    reason = state.get("handoff_reason", "requires_manual_review")
+    escalation_tool = _tools_by_name["escalate_to_human"]
+    try:
+        response = escalation_tool.invoke(
+            {"reason": reason, "customer_message": customer_message}
+        )
+    except Exception as error:
+        print(f"Automatic handoff ticket creation failed: {type(error).__name__}")
+        response = (
+            "This request needs human support, but the demo ticket service is unavailable. "
+            "Please contact a human agent directly."
+        )
+        return {
+            "messages": [AIMessage(content=response)],
+            "support_status": "needs_human",
+        }
+
+    return {
+        "messages": [AIMessage(content=str(response))],
+        "support_status": "handed_off",
+        "handoff_required": False,
+    }
+
+
 def create_graph():
     """
     Build and compile the customer support agent graph.
@@ -174,7 +258,8 @@ def create_graph():
     
     # Add nodes
     workflow.add_node("agent", agent_node)
-    workflow.add_node("tools", ToolNode(tools))  # Automatically handles all tool execution
+    workflow.add_node("tools", execute_tools_node)
+    workflow.add_node("human_handoff", automatic_handoff_node)
     
     # Define the flow
     workflow.add_edge(START, "agent")  # Start at agent
@@ -189,8 +274,13 @@ def create_graph():
         },
     )
     
-    # After tools execute, always go back to agent for next reasoning step
-    workflow.add_edge("tools", "agent")
+    # Route weak retrieval and tool failures to a ticket; otherwise resume reasoning.
+    workflow.add_conditional_edges(
+        "tools",
+        route_after_tools,
+        {"human_handoff": "human_handoff", "agent": "agent"},
+    )
+    workflow.add_edge("human_handoff", END)
 
     # Note: When using langgraph dev/cloud, checkpointing is handled automatically
     # For local testing, you can pass a checkpointer to compile()
