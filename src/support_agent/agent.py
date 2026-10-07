@@ -38,7 +38,7 @@ from .prompts import SYSTEM_PROMPT
 # Get Ollama base URL from environment, default to localhost for local development
 ollama_base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 llm = ChatOllama(
-    model="llama3.1:latest",  # Smaller, faster model for CPU inference (~1GB, much faster responses)
+    model=os.getenv("MODEL_NAME", "llama3.1:latest"),
     temperature=0,  # Deterministic responses for customer support
     base_url=ollama_base_url,  # Use environment variable or default to localhost
     timeout=60.0,  # Reduce timeout from 120s to 60s for faster failure detection

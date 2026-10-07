@@ -1,0 +1,9 @@
+name: customer_support_resume
+channels:
+  - defaults
+dependencies:
+  - python=3.12
+  - pip
+  - pip:
+      - -e .[dev]
+      - langgraph-cli[inmem]

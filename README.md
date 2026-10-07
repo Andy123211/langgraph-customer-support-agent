@@ -1,6 +1,63 @@
 
 # Building an Intelligent Customer Support Agent: A Journey Through the LangChain Ecosystem
 
+> **Reproducible demo scope (2026-10):** This repository is a single LangGraph
+> customer-support demo. Its policy/FAQ index is process-local
+> `InMemoryVectorStore` with BGE-M3 embeddings, BM25 and RRF. A BGE cross-encoder
+> reranker is available behind `ENABLE_RERANKER=true`. Order and inventory
+> tools use mock data; handoff creates a demo ticket. There is no Milvus,
+> calibrated confidence model, intent classifier, long-term memory/PII pipeline,
+> Skills runtime, MCP integration, vLLM comparison, or 300-question benchmark in
+> this repository. Resume metrics that depend on those systems are **not
+> reproduced by this project**.
+
+## Reproducible Local Setup (Windows / Conda)
+
+From the repository root in PowerShell:
+
+```powershell
+conda create -n customer_support_resume python=3.12 pip -y
+conda activate customer_support_resume
+python -m pip install -e ".[dev]" "langgraph-cli[inmem]"
+Copy-Item .env.example .env
+```
+
+The first semantic search downloads BAAI/bge-m3 weights (about 2.2 GB) and
+indexes the bundled JSON policy/FAQ data in memory. Set `HF_HOME` in `.env` to
+put model files in a dedicated cache directory. The reranker downloads its own
+weights (about 0.6 GB) only when enabled. Both models run on CPU by default.
+
+Install [Ollama](https://ollama.com/download), then in a separate terminal:
+
+```powershell
+ollama pull llama3.1:latest
+ollama serve
+```
+
+Start the graph API from the activated Conda environment:
+
+```powershell
+langgraph dev --no-browser
+```
+
+For retrieval and graph handoff tests that do not require model downloads or an
+Ollama server:
+
+```powershell
+$env:PYTHONNOUSERSITE = "1"
+python -m pytest src/support_agent/tests/ -m "not integration"
+```
+
+The graph API may start without contacting Ollama; an actual conversation needs
+the model pulled and Ollama running. Set `ENABLE_RERANKER=true` in `.env` to
+enable BAAI/bge-reranker-v2-m3 after the first model has been downloaded.
+
+The benchmark claims in the resume (300 questions, Recall@5/MRR, refusal rate,
+Youden-J threshold, classifier F1 and ONNX parity) require source datasets and
+artifacts that are not present here. The existing LangSmith script uses 10
+examples and requires user-provided LangSmith credentials; it does not
+reproduce those resume metrics.
+
 ## Introduction
 
 Imagine a customer service agent that never sleeps, responds instantly to inquiries about orders and refunds, knows when to escalate complex issues to humans, and continuously improves through rigorous evaluation. This project brings that vision to life as a demonstration of the LangChain ecosystem's capabilities for building production-ready AI agents.
@@ -13,7 +70,7 @@ Rather than building a sprawling multi-agent system from the outset, this projec
 
 ### The Agent's Journey
 
-When a customer reaches out with a question, the agent springs into action. It searches through a vector database containing company policies and retrieves relevant customer data from mock databases. Armed with this context, it responds to inquiries about orders, refunds, and account issues. But here's the crucial part: the agent knows its limits. When an issue requires human judgment or escalation, it gracefully interrupts the workflow to create a support ticket, ensuring customers get the care they need.
+When a customer reaches out, the agent searches an in-memory index of store policies and FAQs, then consults mock order or inventory data when appropriate. If retrieval is weak or a tool fails, LangGraph routes the request to a demo human-support ticket.
 
 ![Agent Workflow Graph](images/langgraph-graph-mermaid.png)
 
@@ -23,7 +80,7 @@ When a customer reaches out with a question, the agent springs into action. It s
 
 The system architecture reflects real-world production considerations:
 
-- **Knowledge Layer**: Vector database for policy documents and mock customer data stores
+- **Knowledge Layer**: Process-local vector index for policy documents and mock customer data stores
 - **Intelligence Layer**: Powered by Ollama's `llama3.1:latest` model for local, cost-effective inference
 - **Interface Layer**: LangChain Studio and Agent UI provide a streaming chat experience
 - **Quality Assurance**: Comprehensive TDD tests ensure reliability
@@ -94,7 +151,7 @@ A runnable customer-support demo built with:
 - ✅ Hybrid BM25 + vector retrieval with reciprocal-rank fusion (RRF)
 - ✅ Low-relevance and tool-error handoff state transitions
 - ✅ LangSmith evaluation suite with online dashboard
-- ✅ Comprehensive test suite (50+ unit tests)
+- ✅ Pytest suite for graph routing, tools, state, and retrieval components
 
 ## Features
 
@@ -113,7 +170,7 @@ Policy and product questions use two retrieval paths over the same local knowled
 
 1. BM25 ranks exact terms and identifiers.
 2. `InMemoryVectorStore` ranks semantic matches with the configured Hugging Face embedding model.
-3. Reciprocal-rank fusion combines the two ranked lists. A reranker can be injected into `KnowledgeBaseVectorStore(reranker=...)`; its default is disabled and needs no additional service.
+3. Reciprocal-rank fusion combines the two ranked lists. Set `ENABLE_RERANKER=true` to load the local BAAI/bge-reranker-v2-m3 cross-encoder and rerank fused candidates.
 4. The tool reports a bounded relevance heuristic. If no result reaches the default `0.35` threshold, the graph records `handoff_required` and creates a human-support ticket instead of answering from weak evidence.
 
 The threshold and displayed score are demo heuristics, not calibrated confidence probabilities. Tune them against a held-out support-query set before using this pattern beyond a demo. Order, return, and inventory tools remain mock-data examples. Tool exceptions are caught by the graph, hidden from the customer, and routed to the human handoff node.
@@ -482,7 +539,7 @@ The bot has access to these tools:
 
 ## 🧪 Testing
 
-The project includes a comprehensive TDD (Test-Driven Development) test suite with **50+ unit tests** covering all key functionality.
+The pytest suite contains deterministic tests for retrieval, graph routing, state, and mock business tools. It does not include the resume's external benchmark datasets.
 
 ### Test Structure
 
@@ -1471,7 +1528,7 @@ The knowledge base uses semantic vector search for intelligent document retrieva
    - `page_content`: The actual text content
    - `metadata`: Category tags for filtering (return, shipping, payment, product, general)
 
-2. **Embedding Generation**: Each document is converted to a vector embedding using the `sentence-transformers/all-MiniLM-L6-v2` model
+2. **Embedding Generation**: Each document is converted to a vector embedding using the configured model (default: `BAAI/bge-m3`)
 
 3. **Vector Search**: User queries are:
    - Converted to embeddings

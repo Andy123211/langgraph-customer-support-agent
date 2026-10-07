@@ -12,6 +12,7 @@ content even when the words don't match exactly. This makes the agent much bette
 finding relevant information to answer customer questions.
 """
 
+import os
 from langchain_core.vectorstores import InMemoryVectorStore
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_core.documents import Document
@@ -19,6 +20,51 @@ import json
 from pathlib import Path
 from typing import Callable, Optional
 from .retrieval import bm25_relevance, bm25_scores, reciprocal_rank_fusion
+
+
+DEFAULT_EMBEDDINGS_MODEL = "BAAI/bge-m3"
+DEFAULT_RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def create_cross_encoder_reranker(
+    model_name: str = DEFAULT_RERANKER_MODEL,
+    *,
+    device: str = "cpu",
+    encoder=None,
+):
+    """Build a real sentence-transformers cross-encoder reranker.
+
+    `encoder` is injectable so ranking behavior can be tested without downloading
+    model weights. In normal use the CrossEncoder is loaded only when explicitly
+    enabled with ENABLE_RERANKER=true.
+    """
+    if encoder is None:
+        from sentence_transformers import CrossEncoder
+
+        encoder = CrossEncoder(model_name, device=device)
+
+    def rerank(query: str, documents: list[Document]) -> list[Document]:
+        if not documents:
+            return []
+        pairs = [(query, document.page_content) for document in documents]
+        scores = encoder.predict(pairs)
+        if hasattr(scores, "tolist"):
+            scores = scores.tolist()
+        return [
+            document
+            for _, document in sorted(
+                zip(scores, documents), key=lambda pair: float(pair[0]), reverse=True
+            )
+        ]
+
+    return rerank
 
 
 class KnowledgeBaseVectorStore:
@@ -39,8 +85,10 @@ class KnowledgeBaseVectorStore:
 
     def __init__(
         self,
-        embeddings_model: str = "sentence-transformers/all-MiniLM-L6-v2",
+        embeddings_model: Optional[str] = None,
         reranker: Optional[Callable[[str, list[Document]], list[Document]]] = None,
+        *,
+        embeddings=None,
     ):
         """
         Initialize the vector store with embeddings model.
@@ -51,22 +99,24 @@ class KnowledgeBaseVectorStore:
 
         WHY IT'S IMPORTANT:
         The embeddings model is what enables semantic search. Different models have
-        different strengths - this one (all-MiniLM-L6-v2) is a good balance of
-        speed and accuracy.
+        different strengths. The default is the multilingual BAAI/bge-m3 model;
+        deployments can override it with EMBEDDINGS_MODEL.
 
         Args:
-            embeddings_model: HuggingFace model name for embeddings
-                            (default is a fast, accurate model good for general use)
+            embeddings_model: Hugging Face model name; defaults to BAAI/bge-m3
         """
-        self.embeddings = HuggingFaceEmbeddings(
-            model_name=embeddings_model,
-            model_kwargs={'device': 'cpu'},
-            encode_kwargs={'normalize_embeddings': True}
+        self.embeddings_model = embeddings_model or os.getenv(
+            "EMBEDDINGS_MODEL", DEFAULT_EMBEDDINGS_MODEL
+        )
+        self.embeddings = embeddings or HuggingFaceEmbeddings(
+            model_name=self.embeddings_model,
+            model_kwargs={"device": os.getenv("EMBEDDINGS_DEVICE", "cpu")},
+            encode_kwargs={"normalize_embeddings": True},
         )
         self.vector_store: Optional[InMemoryVectorStore] = None
         self.documents_by_id: dict[str, Document] = {}
-        # Optional local or remote cross-encoder adapter. The default path has no
-        # additional model or service dependency.
+        # Optional local or remote cross-encoder adapter. get_vector_store loads
+        # the built-in CrossEncoder adapter when ENABLE_RERANKER=true.
         self.reranker = reranker
 
     def load_from_json(self, json_path: str) -> None:
@@ -356,7 +406,16 @@ def get_vector_store() -> KnowledgeBaseVectorStore:
     global _vector_store_instance
 
     if _vector_store_instance is None:
-        _vector_store_instance = KnowledgeBaseVectorStore()
+        reranker = None
+        if _env_flag("ENABLE_RERANKER"):
+            reranker_model = os.getenv("RERANKER_MODEL", DEFAULT_RERANKER_MODEL)
+            reranker_device = os.getenv("RERANKER_DEVICE", "cpu")
+            print(f"Loading cross-encoder reranker: {reranker_model} ({reranker_device})")
+            reranker = create_cross_encoder_reranker(
+                reranker_model, device=reranker_device
+            )
+        _vector_store_instance = KnowledgeBaseVectorStore(reranker=reranker)
+        print(f"Using embedding model: {_vector_store_instance.embeddings_model}")
 
         # Load knowledge base from default location
         kb_path = Path(__file__).parent.parent.parent / "data" / "knowledge_base.json"

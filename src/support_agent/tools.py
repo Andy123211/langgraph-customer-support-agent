@@ -829,7 +829,6 @@ No sufficiently relevant information found{filter_info}{score_info}.
 
 💡 Try:
    • Using broader search terms
-   • Lowering the similarity threshold
    • Removing category filters
 
 This request should be handed to a human agent instead of answered from weak matches."""
