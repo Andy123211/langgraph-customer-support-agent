@@ -27,12 +27,15 @@ indexes the bundled JSON policy/FAQ data in memory. Set `HF_HOME` in `.env` to
 put model files in a dedicated cache directory. The reranker downloads its own
 weights (about 0.6 GB) only when enabled. Both models run on CPU by default.
 
-Install [Ollama](https://ollama.com/download), then in a separate terminal:
+For local chat inference, install [Ollama](https://ollama.com/download), then in a separate terminal:
 
 ```powershell
 ollama pull llama3.1:latest
 ollama serve
 ```
+
+Ollama is optional; an OpenAI-compatible API can be configured instead as
+described below.
 
 Start the graph API from the activated Conda environment:
 
@@ -51,6 +54,27 @@ python -m pytest src/support_agent/tests/ -m "not integration"
 The graph API may start without contacting Ollama; an actual conversation needs
 the model pulled and Ollama running. Set `ENABLE_RERANKER=true` in `.env` to
 enable BAAI/bge-reranker-v2-m3 after the first model has been downloaded.
+
+### Use an OpenAI-compatible API instead of Ollama
+
+The API format shown in the project setup screenshot can be used by switching
+the chat provider. Copy the endpoint and model name into the local `.env`, then
+enter the API key locally; the screenshot masks the key, so it is not included
+in this repository:
+
+```dotenv
+LLM_PROVIDER=openai_compatible
+OPENAI_COMPATIBLE_BASE_URL=https://lin312354.top/cliproxy/v1
+OPENAI_COMPATIBLE_API_KEY=your_key_here
+MODEL_NAME=devin/swe-2(high)
+```
+
+Restart `langgraph dev` after changing `.env`. Keep the key private and do not
+commit `.env`. The endpoint and selected model must support OpenAI-compatible
+Chat Completions with tool calls, since the agent binds its retrieval and order
+tools to the chat model. This mode sends prompts to that external API and may
+incur usage charges. Ollama remains the default local option when
+`LLM_PROVIDER` is unset or set to `ollama`.
 
 The benchmark claims in the resume (300 questions, Recall@5/MRR, refusal rate,
 Youden-J threshold, classifier F1 and ONNX parity) require source datasets and

@@ -35,18 +35,48 @@ from .prompts import SYSTEM_PROMPT
 #      (like searching the knowledge base or checking order status)
 #      Temperature=0 makes responses more predictable/consistent, which is important
 #      for customer support where you want reliable, professional answers
-# Get Ollama base URL from environment, default to localhost for local development
-ollama_base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-llm = ChatOllama(
-    model=os.getenv("MODEL_NAME", "llama3.1:latest"),
-    temperature=0,  # Deterministic responses for customer support
-    base_url=ollama_base_url,  # Use environment variable or default to localhost
-    timeout=60.0,  # Reduce timeout from 120s to 60s for faster failure detection
-    model_kwargs={
-        "num_ctx": 4096,  # Limit context window for faster processing (default is much larger, often 131072)
-        "num_predict": 512,  # Limit max tokens to generate for faster responses
-    },
-).bind_tools(tools)
+def build_chat_model():
+    """Create the configured Ollama or OpenAI-compatible chat model."""
+    provider = os.getenv("LLM_PROVIDER", "ollama").strip().lower()
+    model_name = os.getenv("MODEL_NAME", "llama3.1:latest")
+    if provider == "ollama":
+        return ChatOllama(
+            model=model_name,
+            temperature=0,
+            base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
+            timeout=60.0,
+            model_kwargs={"num_ctx": 4096, "num_predict": 512},
+        ).bind_tools(tools)
+
+    if provider == "openai_compatible":
+        from langchain_openai import ChatOpenAI
+
+        api_key = os.getenv("OPENAI_COMPATIBLE_API_KEY", "").strip()
+        base_url = os.getenv("OPENAI_COMPATIBLE_BASE_URL", "").strip()
+        if not api_key:
+            raise RuntimeError(
+                "LLM_PROVIDER=openai_compatible requires OPENAI_COMPATIBLE_API_KEY. "
+                "Set it in the local .env file; do not commit the key."
+            )
+        if not base_url:
+            raise RuntimeError(
+                "LLM_PROVIDER=openai_compatible requires OPENAI_COMPATIBLE_BASE_URL."
+            )
+        return ChatOpenAI(
+            model=model_name,
+            api_key=api_key,
+            base_url=base_url,
+            temperature=0,
+            timeout=60.0,
+            max_retries=1,
+        ).bind_tools(tools)
+
+    raise ValueError(
+        f"Unsupported LLM_PROVIDER={provider!r}; supported values: ollama, openai_compatible"
+    )
+
+
+llm = build_chat_model()
 
 
 def agent_node(state: SupportState) -> dict:
@@ -82,7 +112,7 @@ def agent_node(state: SupportState) -> dict:
     # Invoke LLM - it will decide to call tools or respond directly
     # Add timeout to prevent hanging
     try:
-        print(f"DEBUG: Calling LLM with {len(messages)} messages, base_url={ollama_base_url}")
+        print(f"DEBUG: Calling LLM with {len(messages)} messages")
         response = llm.invoke(messages)
         print(f"DEBUG: LLM response received: {type(response)}")
         return {"messages": [response]}
