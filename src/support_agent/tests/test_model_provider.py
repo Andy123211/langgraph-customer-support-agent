@@ -28,7 +28,7 @@ def test_openai_compatible_provider_uses_local_endpoint_and_key(monkeypatch):
     assert captured["api_key"] == "local-test-key"
     assert captured["base_url"] == "https://example.invalid/v1"
     assert captured["model"] == "example/tool-model"
-    assert captured["temperature"] == 0
+    assert "temperature" not in captured
     assert captured["tools"] == agent.tools
 
 

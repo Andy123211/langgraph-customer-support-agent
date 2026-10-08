@@ -66,7 +66,6 @@ def build_chat_model():
             model=model_name,
             api_key=api_key,
             base_url=base_url,
-            temperature=0,
             timeout=60.0,
             max_retries=1,
         ).bind_tools(tools)

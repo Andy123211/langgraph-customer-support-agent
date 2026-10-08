@@ -76,6 +76,10 @@ tools to the chat model. This mode sends prompts to that external API and may
 incur usage charges. Ollama remains the default local option when
 `LLM_PROVIDER` is unset or set to `ollama`.
 
+The compatible provider leaves `temperature` unset because some API gateways
+reject that optional Chat Completions parameter. Ollama continues to use a
+deterministic temperature of 0.
+
 The benchmark claims in the resume (300 questions, Recall@5/MRR, refusal rate,
 Youden-J threshold, classifier F1 and ONNX parity) require source datasets and
 artifacts that are not present here. The existing LangSmith script uses 10
